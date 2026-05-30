@@ -148,14 +148,17 @@ def main_pipeline():
             if len(df_base_h) > 0:
                 thru_thresh = np.percentile(df_base_h['Speed'], 15)      # 網速平日低端門檻 (後15%)
                 latency_thresh = np.percentile(df_base_h['Latency'], 85) # 延遲平日頂峰天花板 (前85%)
+                loss_thresh = np.percentile(df_base_h['LossRate'], 85) # 丟失平日頂峰天花板 (前85%)
                 n_base = len(df_base_h) / num_baseline_days
             else:
                 thru_thresh = 15.0
                 latency_thresh = 40.0
+                loss_thresh = 0.1
                 n_base = 15.0
             baseline_thresholds[wall_hour] = {
                 'thru_thresh': thru_thresh, 
                 'latency_thresh': latency_thresh,
+                'loss_thresh': loss_thresh,
                 'n_base': n_base
             }
             
@@ -173,6 +176,7 @@ def main_pipeline():
             thresh_stats = baseline_thresholds[wall_hour]
             thru_thresh = thresh_stats['thru_thresh']
             latency_thresh = thresh_stats['latency_thresh']
+            loss_thresh = thresh_stats['loss_thresh']
             n_base = thresh_stats['n_base']
             
             # 特徵一：網速門檻超越率 (Net_Collapse_Rate)
@@ -184,8 +188,8 @@ def main_pipeline():
             # 特徵三：延遲異動率 (Latency_Spike_Rate) -> 超越平日天花板比例
             latency_spike_rate = (df_nye_h['Latency'] > latency_thresh).sum() / n_nye if n_nye > 0 else 0.0
             
-            # 特徵四：嚴重複雜丟包率 (Loss_Prevalence_Rate) -> 遭遇實體設備強制丟包 > 1% 比例
-            loss_prevalence_rate = (df_nye_h['LossRate'] > 0.01).sum() / n_nye if n_nye > 0 else 0.0
+            # 特徵四：嚴重複雜丟包率 (Loss_Prevalence_Rate) -> 遭遇實體設備強制丟包 > loss_thresh 比例
+            loss_prevalence_rate = (df_nye_h['LossRate'] > loss_thresh).sum() / n_nye if n_nye > 0 else 0.0
             
             # 讀取該小時對應的「捷運累積滯留人數」
             mrt_stock_volume = hourly_accumulated_crowd[idx] 

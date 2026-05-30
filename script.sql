@@ -1,3 +1,5 @@
+-- 查詢 12/31 到 1/2 的手機測試數據
+
 SELECT 
   a.TestTime,
   a.UUID,

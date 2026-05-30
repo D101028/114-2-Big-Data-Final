@@ -1,3 +1,5 @@
+"""獨立模型分析"""
+
 import pandas as pd
 import statsmodels.api as sm
 
