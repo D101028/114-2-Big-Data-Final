@@ -1,6 +1,7 @@
 import json
 from typing import List, Dict
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
 CITY = "Taipei City"
@@ -425,47 +426,61 @@ def plot_network_performance_report_2(
     timezone: int,
     output_path: str = "network_performance_report.png",
 ):
-    """輸入多個 df (以 dict 傳入名稱)，將各時段內所有日期的資料加總平均，
-    並繪製三聯子圖。
+    """輸入多個 df (以 dict 傳入，包含 'baseline' 與跨年資料)，
+    依據各時段（HourRange）的平日基準計算動態門檻，並繪製三聯子圖進行對比。
     
     指標調整：
-    - 子圖 1 (Speed): 低於 15% 門檻的資料佔比
-    - 子圖 2 (Latency): 高於 85% 門檻的資料佔比
-    - 子圖 3 (Loss): 高於 85% 門檻的資料佔比
+    - 子圖 1 (Speed): 低於該小時平日 15% 門檻的資料佔比
+    - 子圖 2 (Latency): 高於該小時平日 85% 門檻的資料佔比
+    - 子圖 3 (Loss): 高於該小時平日 85% 門檻的資料佔比
     """
     
     # -------------------------------------------------------------------------
-    # ✨ 核心修改 1：全域門檻計算
-    # 為了讓「高於 85% 占比」有比較意義，我們需要先算出全體（或某一基準）的 85 百分位數作為固定門檻
+    # ✨ 核心修改 1：從 baseline 計算「每小時動態門檻」
     # -------------------------------------------------------------------------
-    all_processed_dfs = []
-    for name, df in df_dict.items():
-        filtered_df = _preprocess_df(df, city).copy()
-        if not filtered_df.empty:
-            filtered_df["Dataset"] = name
-            all_processed_dfs.append(filtered_df)
-            
-    if not all_processed_dfs:
-        print("錯誤：沒有任何有效的繪圖數據。")
+    if "baseline" not in df_dict:
+        print("錯誤：輸入的 df_dict 中必須包含 'baseline' 鍵值作為基準數據。")
         return
 
-    # 合併所有未聚合的原始資料，用來計算全局的第 85 百分位數門檻
-    # (你也可以手動指定固定數值，例如 latency_threshold = 100)
-    global_df = pd.concat(all_processed_dfs, ignore_index=True)
-    speed_threshold = global_df["Latency"].quantile(0.15)
-    latency_threshold = global_df["Latency"].quantile(0.85)
-    loss_threshold = global_df["LossRate"].quantile(0.85)
+    # 先預處理基準資料
+    baseline_filtered = _preprocess_df(df_dict["baseline"], city).copy()
+    if baseline_filtered.empty:
+        print("錯誤：Baseline 數據經過過濾後為空，無法建立門檻。")
+        return
 
-    print(f"依據全體數據計算之 85% 門檻 -> 延遲: {latency_threshold:.2f} ms, 丟包率: {loss_threshold:.4f}")
+    # 依據 HourRange 計算平日每小時的 15% 與 85% 百分位數
+    # 這裡使用 observed=False 確保 Categorical 欄位行為正常
+    thresh_df = (
+        baseline_filtered.groupby("HourRange", observed=False)
+        .agg(
+            speed_threshold=("Speed", lambda x: x.quantile(0.15) if len(x) > 0 else 15.0),
+            latency_threshold=("Latency", lambda x: x.quantile(0.85) if len(x) > 0 else 40.0),
+            loss_threshold=("LossRate", lambda x: x.quantile(0.85) if len(x) > 0 else 0.1),
+        )
+        .reset_index()
+    )
 
+    # -------------------------------------------------------------------------
+    # ✨ 核心修改 2：將動態門檻對齊到所有資料集（含 baseline 自己）並計算超標率
+    # -------------------------------------------------------------------------
     all_groups = []
-    for filtered_df in all_processed_dfs:
-        name = filtered_df["Dataset"].iloc[0]
+    for name, df in df_dict.items():
+        filtered_df = _preprocess_df(df, city).copy()
+        if filtered_df.empty:
+            continue
 
-        # 標記是否超過門檻
-        filtered_df["IsLowSpeed"] = filtered_df["Speed"] < speed_threshold
-        filtered_df["IsHighLatency"] = filtered_df["Latency"] > latency_threshold
-        filtered_df["IsHighLoss"] = filtered_df["LossRate"] > loss_threshold
+        # 將該小時對應的門檻透過 merge 併入當前資料集
+        filtered_df = filtered_df.merge(thresh_df, on="HourRange", how="left")
+        
+        # 安全防護：若有特定時段在 baseline 沒出現，給予預設值
+        filtered_df["speed_threshold"] = filtered_df["speed_threshold"].fillna(15.0)
+        filtered_df["latency_threshold"] = filtered_df["latency_threshold"].fillna(40.0)
+        filtered_df["loss_threshold"] = filtered_df["loss_threshold"].fillna(0.1)
+
+        # 標記是否超越該小時的動態門檻
+        filtered_df["IsLowSpeed"] = filtered_df["Speed"] < filtered_df["speed_threshold"]
+        filtered_df["IsHighLatency"] = filtered_df["Latency"] > filtered_df["latency_threshold"]
+        filtered_df["IsHighLoss"] = filtered_df["LossRate"] > filtered_df["loss_threshold"]
 
         # 一次性聚合所有需要的統計量（數量與分子）
         grouped = (
@@ -484,27 +499,32 @@ def plot_network_performance_report_2(
         )
         
         # 計算各指標的「超標百分比」與「標籤文字 (分子/分母)」
-        grouped["LowSpeedPercentage"] = (grouped["Speed_Sum"] / grouped["Speed_Count"]) * 100
-        grouped["SpeedLabelText"] = grouped["Speed_Sum"].astype(str) + "/" + grouped["Speed_Count"].astype(str)
+        grouped["LowSpeedPercentage"] = (grouped["Speed_Sum"] / grouped["Speed_Count"].replace(0, np.nan)) * 100
+        grouped["SpeedLabelText"] = grouped["Speed_Sum"].astype(str) + "/" + grouped["Speed_Count"].astype(str) # type: ignore
         
-        grouped["HighLatencyPercentage"] = (grouped["Latency_Sum"] / grouped["Latency_Count"]) * 100
-        grouped["LatencyLabelText"] = grouped["Latency_Sum"].astype(str) + "/" + grouped["Latency_Count"].astype(str)
+        grouped["HighLatencyPercentage"] = (grouped["Latency_Sum"] / grouped["Latency_Count"].replace(0, np.nan)) * 100
+        grouped["LatencyLabelText"] = grouped["Latency_Sum"].astype(str) + "/" + grouped["Latency_Count"].astype(str) # type: ignore
         
-        grouped["HighLossPercentage"] = (grouped["Loss_Sum"] / grouped["Loss_Count"]) * 100
-        grouped["LossLabelText"] = grouped["Loss_Sum"].astype(str) + "/" + grouped["Loss_Count"].astype(str)
+        grouped["HighLossPercentage"] = (grouped["Loss_Sum"] / grouped["Loss_Count"].replace(0, np.nan)) * 100
+        grouped["LossLabelText"] = grouped["Loss_Sum"].astype(str) + "/" + grouped["Loss_Count"].astype(str) # type: ignore
         
         grouped["Dataset"] = name
         all_groups.append(grouped)
 
+    if not all_groups:
+        print("錯誤：沒有任何有效的繪圖數據。")
+        return
+
     # 合併多組資料
     combined = pd.concat(all_groups, ignore_index=True)
+    combined.to_csv("test.csv", index=False)
 
     # 定義自訂的 X 軸時段順序
     custom_order = ["12", "15", "18", "21", "22", "23", "0", "1", "2", "3", "6", "9"]
     combined["HourRange"] = pd.Categorical(combined["HourRange"], categories=custom_order, ordered=True)
     combined = combined.sort_values("HourRange")
 
-    # 轉置各指標資料成繪圖矩陣
+    # 轉置各指標資料成繪圖矩陣（此時 columns 會包含 'baseline' 與跨年夜標籤）
     pivot_speed = combined.pivot(index="HourRange", columns="Dataset", values="LowSpeedPercentage").fillna(0)
     pivot_speed_labels = combined.pivot(index="HourRange", columns="Dataset", values="SpeedLabelText").fillna("0/0")
     
@@ -514,23 +534,35 @@ def plot_network_performance_report_2(
     pivot_loss = combined.pivot(index="HourRange", columns="Dataset", values="HighLossPercentage").fillna(0)
     pivot_loss_labels = combined.pivot(index="HourRange", columns="Dataset", values="LossLabelText").fillna("0/0")
 
+    # 確保 baseline 在圖例/柱狀圖排序中排在最前面，方便對比
+    if "baseline" in pivot_speed.columns:
+        cols_order = ["baseline"] + [c for c in pivot_speed.columns if c != "baseline"]
+        pivot_speed = pivot_speed[cols_order]
+        pivot_speed_labels = pivot_speed_labels[cols_order]
+        pivot_latency = pivot_latency[cols_order]
+        pivot_latency_labels = pivot_latency_labels[cols_order]
+        pivot_loss = pivot_loss[cols_order]
+        pivot_loss_labels = pivot_loss_labels[cols_order]
+
     # 建立 3x1 的畫布
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(14, 18), sharex=True)
-    colors = ["#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F", "#EDC948"]
+    
+    # 調整顏色配比：基準組用灰色/冷色，對照組用鮮明色
+    colors = ["#7F8C8D", "#4E79A7", "#F28E2B", "#E15759", "#76B7B2"]
     color_slice = colors[:len(pivot_speed.columns)]
 
-    # --- 子圖 1: 低速比率 (Speed) - 保持不變 ---
+    # --- ✨ 核心修改 3：子圖標題與說明文字更新（因為每小時門檻不同，改標註百分位數定義） ---
+    # 子圖 1: 低速比率 (Speed)
     pivot_speed.plot(kind="bar", ax=ax1, color=color_slice, width=0.8)
-    ax1.set_title(f"{city}: Low Speed (<{speed_threshold:.1f}Mbps) Ratio Comparison by Intervals", fontsize=14)
+    ax1.set_title(f"{city}: Low Speed (< Hourly Baseline 15th Pctl) Ratio Comparison by Intervals", fontsize=14)
     ax1.set_ylabel("Low Speed Percentage (%)", fontsize=12)
     ax1.set_ylim(0, 115)
     ax1.grid(axis="y", linestyle="--", alpha=0.3)
     ax1.legend(title="Dataset")
 
-    # --- ✨ 核心修改 2：子圖 2 延遲與子圖 3 丟包率的繪圖與標註更新 ---
     # 子圖 2: 高延遲比率 (Latency)
     pivot_latency.plot(kind="bar", ax=ax2, color=color_slice, width=0.8)
-    ax2.set_title(f"{city}: High Latency (>{latency_threshold:.1f}ms) Ratio Comparison by Intervals", fontsize=14)
+    ax2.set_title(f"{city}: High Latency (> Hourly Baseline 85th Pctl) Ratio Comparison by Intervals", fontsize=14)
     ax2.set_ylabel("High Latency Percentage (%)", fontsize=12)
     ax2.set_ylim(0, 115)
     ax2.grid(axis="y", linestyle="--", alpha=0.3)
@@ -538,7 +570,7 @@ def plot_network_performance_report_2(
 
     # 子圖 3: 高丟包比率 (Packet Loss)
     pivot_loss.plot(kind="bar", ax=ax3, color=color_slice, width=0.8)
-    ax3.set_title(f"{city}: High Loss Rate (>{loss_threshold:.4f}) Ratio Comparison by Intervals", fontsize=14)
+    ax3.set_title(f"{city}: High Loss Rate (> Hourly Baseline 85th Pctl) Ratio Comparison by Intervals", fontsize=14)
     ax3.set_ylabel("High Loss Percentage (%)", fontsize=12)
     ax3.set_xlabel(f"Time Range (UTC{timezone:+d})", fontsize=12)
     ax3.set_ylim(0, 115)
@@ -546,7 +578,7 @@ def plot_network_performance_report_2(
     ax3.legend(title="Dataset")
     ax3.set_xticklabels(pivot_loss.index, rotation=0)
 
-    # 統一三個子圖的文字標註邏輯 (因為現在全部都是百分比與「分子/分母」格式)
+    # 統一三個子圖的文字標註邏輯
     axes_and_labels = [
         (ax1, pivot_speed, pivot_speed_labels),
         (ax2, pivot_latency, pivot_latency_labels),
@@ -572,13 +604,13 @@ def plot_network_performance_report_2(
                     ha="center",
                     va="bottom",
                     fontsize=8,
-                    fontweight="bold" if h > 0 else "normal",
+                    fontweight="bold" if h > 15.1 or (dataset_name != "baseline" and h > 0) else "normal",
                 )
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=300)
     plt.close(fig)
-    print(f"成功：網路效能三聯綜合圖已排序並儲存至 {output_path}")
+    print(f"成功：網路效能動態基準對比圖已儲存至 {output_path}")
 
 def plot_ny_network_report(
     df_dict: Dict[str, pd.DataFrame],
